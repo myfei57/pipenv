@@ -439,6 +439,64 @@ def _add_upgrade_options(p):
     _add_lock_only_option(p)
 
 
+def _add_lock_diff_subparser(lock_parser):
+    """Register the nested ``pipenv lock diff`` subcommand."""
+    lock_subs = lock_parser.add_subparsers(dest="lock_subcommand")
+    diff_parser = lock_subs.add_parser(
+        "diff",
+        add_help=False,
+        help="Compare two Pipfile.lock/pylock.toml files under explicit targets.",
+    )
+    diff_parser.add_argument(
+        "-h", "--help", dest="help", action="store_true", default=False
+    )
+    # Optional at parse time so ``pipenv lock diff --help`` can render before
+    # the handler validates that both paths were supplied.
+    diff_parser.add_argument(
+        "left",
+        nargs="?",
+        help="Path to the first (base) Pipfile.lock or pylock.toml file.",
+    )
+    diff_parser.add_argument(
+        "right",
+        nargs="?",
+        help="Path to the second (replacement) Pipfile.lock or pylock.toml file.",
+    )
+    diff_parser.add_argument(
+        "--targets",
+        dest="targets",
+        action="append",
+        default=None,
+        metavar="JSON",
+        help=(
+            "Explicit target as inline JSON, or @path to a JSON file "
+            "(object or array). Keys: name, markers, groups, extras. "
+            "Repeatable."
+        ),
+    )
+    diff_parser.add_argument(
+        "--targets-file",
+        dest="targets_file",
+        default=None,
+        metavar="PATH",
+        help="Load target definitions from a JSON file.",
+    )
+    diff_parser.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        default=False,
+        help="Emit the stable machine-readable JSON report instead of text.",
+    )
+    diff_parser.add_argument(
+        "--json-output",
+        dest="json_output",
+        default=None,
+        metavar="PATH",
+        help="Write the machine JSON report to PATH alongside the text summary.",
+    )
+
+
 # ── PIPENV_ environment variable overlay ─────────────────────────────────────
 
 # Destination names for boolean (store_true) arguments — needed to apply the
@@ -674,6 +732,7 @@ def build_parser():
     p = subs.add_parser("lock", add_help=False, help="Generate Pipfile.lock.")
     p.add_argument("-h", "--help", dest="help", action="store_true", default=False)
     _add_lock_options(p)
+    _add_lock_diff_subparser(p)
 
     # ── shell ─────────────────────────────────────────────────────────────────
     p = subs.add_parser(

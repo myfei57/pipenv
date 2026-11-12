@@ -201,7 +201,47 @@ def cmd_uninstall(args, state):
         sys.exit(retcode)
 
 
+def cmd_lock_diff(args, state):
+    import json
+
+    from pipenv.utils.lockdiff import (
+        LockDiffError,
+        diff_paths,
+        parse_target_specs,
+        render_text_report,
+    )
+
+    try:
+        if not args.left or not args.right:
+            raise LockDiffError("both left and right lock file paths are required")
+        targets = parse_target_specs(args.targets, args.targets_file)
+        report = diff_paths(args.left, args.right, targets)
+    except LockDiffError as exc:
+        err.print(f"[bold red]pipenv lock diff: {exc}[/bold red]")
+        sys.exit(2)
+
+    if args.json_output:
+        output_path = Path(args.json_output)
+        output_path.write_text(
+            json.dumps(report, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+        )
+
+    if args.as_json:
+        print(json.dumps(report, sort_keys=True, indent=2))
+    else:
+        print(render_text_report(report))
+
+    if report["status"] == "incomplete":
+        sys.exit(2)
+    if report["status"] == "changed":
+        sys.exit(1)
+    return 0
+
+
 def cmd_lock(args, state):
+    if getattr(args, "lock_subcommand", None) == "diff":
+        return cmd_lock_diff(args, state)
+
     from pipenv.routines.context import RoutineContext
     from pipenv.routines.lock import do_lock
     from pipenv.utils.project import ensure_project
@@ -834,6 +874,9 @@ def cli():
     # ── Subcommand --help ─────────────────────────────────────────────────────
     if getattr(args, "help", False):
         sub = _get_subparser(parser, cmd)
+        nested = getattr(args, "lock_subcommand", None)
+        if sub is not None and nested:
+            sub = _get_subparser(sub, nested)
         if sub is not None:
             console.print(format_help(sub.format_help()))
         else:
