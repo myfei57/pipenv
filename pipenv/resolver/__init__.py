@@ -27,6 +27,19 @@ from pipenv.resolver.main import (
 from pipenv.resolver.manifest_cache import CachedManifest, ParsedManifestCache
 from pipenv.resolver.pep691 import PEP691Client
 from pipenv.resolver.pep691_types import FetchError, SimplePageResponse
+from pipenv.resolver.snapshot import (
+    IncompleteSnapshot,
+    RecordingSession,
+    ReplayFetcher,
+    ReplayMiss,
+    ReplaySession,
+    RequestMismatch,
+    SnapshotCorrupt,
+    SnapshotError,
+    compare_lock_entries,
+    load_snapshot,
+    write_snapshot,
+)
 
 __all__ = [
     # Initiative G phase 1 (T17) — pure-Python simple-API client surface.
@@ -38,6 +51,18 @@ __all__ = [
     "ParallelFetcher",
     "ParsedManifestCache",
     "SimplePageResponse",
+    # Record/replay resolution snapshots.
+    "IncompleteSnapshot",
+    "RecordingSession",
+    "ReplayFetcher",
+    "ReplayMiss",
+    "ReplaySession",
+    "RequestMismatch",
+    "SnapshotCorrupt",
+    "SnapshotError",
+    "compare_lock_entries",
+    "load_snapshot",
+    "write_snapshot",
     # Subprocess entry point + typed-schema bridge.
     "_main",
     "main",

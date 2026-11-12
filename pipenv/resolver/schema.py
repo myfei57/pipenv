@@ -124,6 +124,71 @@ class RequestMetadata:
     deadline_seconds: float | None = None
 
 
+@dataclass(frozen=True)
+class SnapshotMode:
+    """Record/replay mode for the pure-Python resolver.
+
+    Additive, optional request component (SCHEMA_VERSION stays at 1):
+    when absent the resolver behaves exactly as before.
+
+    Fields
+    ------
+    mode:
+        ``"record"`` writes a content-addressed snapshot of the
+        manifests and wheel metadata the resolve actually consumes;
+        ``"replay"`` resolves strictly offline from a previously
+        recorded snapshot.
+    path:
+        Snapshot directory.  Record mode publishes ``snapshot.json``
+        and ``blobs/`` there; replay mode reads them.
+    principal_namespace:
+        Caller-supplied, non-secret label identifying the authorization
+        view of the configured sources.  Credentials are never written
+        into a snapshot; views that share a stripped URL but differ in
+        authorization stay partitioned by this namespace rather than
+        being merged.
+    strict:
+        Replay-only (ignored by record).  When true — the default —
+        replay refuses incomplete snapshots, incompatible requests and
+        raises an explicit ReplayMiss on any unrecorded fetch.
+    """
+
+    mode: str
+    path: str
+    principal_namespace: str = "default"
+    strict: bool = True
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("record", "replay"):
+            raise ValueError(
+                f"SnapshotMode.mode must be 'record' or 'replay', got {self.mode!r}"
+            )
+        if not self.path:
+            raise ValueError("SnapshotMode.path must be a non-empty directory path")
+        if not self.principal_namespace:
+            raise ValueError(
+                "SnapshotMode.principal_namespace must be a non-empty, "
+                "credential-free label"
+            )
+
+    def to_json_dict(self) -> dict:
+        return {
+            "mode": self.mode,
+            "path": self.path,
+            "principal_namespace": self.principal_namespace,
+            "strict": bool(self.strict),
+        }
+
+    @classmethod
+    def from_json_dict(cls, data: Mapping[str, Any]) -> SnapshotMode:
+        return cls(
+            mode=str(data["mode"]),
+            path=str(data["path"]),
+            principal_namespace=str(data.get("principal_namespace", "default")),
+            strict=bool(data.get("strict", True)),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Result-side discriminated union (response)
 # ---------------------------------------------------------------------------
@@ -646,6 +711,10 @@ class ResolverRequest:
     extra_pip_args: Sequence[str] = ()
     resolved_default_deps: ResolvedDeps | None = None
     metadata: RequestMetadata = field(default_factory=RequestMetadata)
+    # Additive (SCHEMA_VERSION stays 1): record/replay snapshot mode.
+    # Suppressed on the wire entirely when unset so older fixtures and
+    # wire-shape goldens remain byte-identical.
+    snapshot: SnapshotMode | None = None
 
     def to_json_dict(self) -> dict:
         """Return a deterministic JSON-ready dict (no None values)."""
@@ -686,6 +755,10 @@ class ResolverRequest:
             }
             if meta_dict != default_meta:
                 out["metadata"] = meta_dict
+        # Snapshot mode is additive: omit entirely when unset so the
+        # default wire shape is unchanged.
+        if self.snapshot is not None:
+            out["snapshot"] = self.snapshot.to_json_dict()
         return out
 
     @classmethod
@@ -717,6 +790,12 @@ class ResolverRequest:
             metadata = RequestMetadata(**metadata_data)
         else:
             metadata = RequestMetadata()
+        snapshot_data = data.get("snapshot")
+        snapshot = (
+            SnapshotMode.from_json_dict(snapshot_data)
+            if snapshot_data is not None
+            else None
+        )
         return cls(
             schema_version=sv,
             category=data["category"],
@@ -727,6 +806,7 @@ class ResolverRequest:
             extra_pip_args=tuple(data.get("extra_pip_args", ())),
             resolved_default_deps=resolved_default_deps,
             metadata=metadata,
+            snapshot=snapshot,
         )
 
 
@@ -908,6 +988,7 @@ __all__ = [
     "ResolverResponse",
     "ResolverResult",
     "ResolverSuccess",
+    "SnapshotMode",
     "Source",
     "VCSPin",
 ]

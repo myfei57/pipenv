@@ -1,0 +1,12 @@
+The ``pure-python`` resolver backend now supports record/replay resolution
+snapshots (``ResolverRequest.snapshot``).  Record mode publishes a
+content-addressed snapshot of the simple-index manifests, PEP 658 wheel
+metadata, canonical request, marker environment and selection-affecting
+configuration actually consumed by a resolve; replay mode re-runs the same
+candidate world strictly offline, verifying every digest and raising an
+explicit ``ReplayMiss`` for any unrecorded fetch instead of touching the
+network or the host cache.  Credentials are never persisted, authorization
+views are partitioned by a caller-supplied principal namespace, and
+sdist/VCS/dynamic sources mark the recording incomplete so strict replay
+refuses them.  Replay results are compared against the recording at lock-entry
+granularity (version, markers, hashes, source), not merely by success.

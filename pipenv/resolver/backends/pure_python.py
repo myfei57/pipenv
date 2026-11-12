@@ -43,9 +43,10 @@ sits on the typed schema surface, not on patched-pip internals.
 from __future__ import annotations
 
 import os
+import tempfile
 import traceback
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from pipenv.resolver.pure_python_metadata import (
     MetadataCache,
@@ -65,6 +66,30 @@ from pipenv.resolver.schema import (
     ResolverRequest,
     ResolverResponse,
     ResolverSuccess,
+)
+from pipenv.resolver.snapshot import (
+    IncompleteSnapshot,
+    RecordingSession,
+    ReplayFetcher,
+    ReplaySession,
+    RequestMismatch,
+    SnapshotBundle,
+    SnapshotCorrupt,
+    SnapshotError,
+    algorithm_versions,
+    check_request_compatible,
+    collect_embedded_secrets,
+    compare_algorithm_versions,
+    compare_lock_entries,
+    detect_unrecordable_top_level_specs,
+    enrich_manifest_identities,
+    ensure_strictly_replayable,
+    freeze_request,
+    load_snapshot,
+    scan_tree_for_secrets,
+    utc_now_iso,
+    write_replay_report,
+    write_snapshot,
 )
 from pipenv.vendor.packaging.specifiers import (
     InvalidSpecifier,
@@ -146,15 +171,50 @@ class PurePythonBackend:
         Returns a typed :class:`ResolverResponse`.  Failure modes are
         translated to structured ``result`` variants rather than raised
         out of the backend (per the Initiative F ``Backend`` contract).
+
+        Snapshot modes (``request.snapshot``):
+
+        * ``record`` — the normal online resolve runs behind a
+          recording transport; on success the consumed manifests, wheel
+          metadata, canonical request, marker environment and the
+          resulting lock entries are published as a content-addressed
+          snapshot.  Un-recordable sources mark the bundle incomplete;
+          a failed or un-writable resolve never publishes one.
+        * ``replay`` — collaborators are replaced by strictly-offline,
+          snapshot-backed equivalents before the host cache or any
+          network client is constructed.  Unrecorded fetches surface
+          as an explicit ReplayMiss; the replay result is compared to
+          the recorded lock entries (version, markers, hashes, source).
         """
-        # Bootstrap collaborators from the request when not pre-injected
-        # (T9b, 2026-05-12).  Production code arrives here via the
-        # Initiative F registry's ``get_backend("pure-python")`` helper
-        # which calls ``cls()`` with no args (T10) — so the four
-        # collaborators are ``None`` on ``self``.  Unit tests still
-        # inject them via ``__init__`` kwargs; the bootstrap is
-        # idempotent and only fills fields that are currently ``None``.
-        self._bootstrap_from_request(request)
+        snapshot_mode = request.snapshot
+        replay_state: dict[str, Any] | None = None
+        recorder: RecordingSession | None = None
+        record_reasons: tuple[str, ...] = ()
+
+        # Replay must install offline collaborators BEFORE the normal
+        # bootstrap would touch the host cache or build a network
+        # session.  A structured error response short-circuits resolve.
+        if snapshot_mode is not None and snapshot_mode.mode == "replay":
+            replay_collaborators = self._begin_snapshot_replay(
+                request, snapshot_mode
+            )
+            if isinstance(replay_collaborators, ResolverResponse):
+                return replay_collaborators
+            replay_state = replay_collaborators
+        else:
+            # Bootstrap collaborators from the request when not pre-injected
+            # (T9b, 2026-05-12).  Production code arrives here via the
+            # Initiative F registry's ``get_backend("pure-python")`` helper
+            # which calls ``cls()`` with no args (T10) — so the four
+            # collaborators are ``None`` on ``self``.  Unit tests still
+            # inject them via ``__init__`` kwargs; the bootstrap is
+            # idempotent and only fills fields that are currently ``None``.
+            self._bootstrap_from_request(request)
+
+        if snapshot_mode is not None and snapshot_mode.mode == "record":
+            recorder, record_reasons = self._begin_snapshot_record(
+                request, snapshot_mode
+            )
 
         # --- index URLs from request.sources ----------------------------
         # request.sources is the post-mirror-substitution source list;
@@ -185,6 +245,11 @@ class PurePythonBackend:
         ]
         try:
             self._fetcher.populate(targets)
+        except SnapshotError as exc:
+            # ReplayMiss / SnapshotCorrupt during pre-fetch must surface
+            # as a structured response, never escape ``resolve`` and
+            # never degrade into the generic "no candidates" message.
+            return self._snapshot_error_response(str(exc))
         except Exception:  # noqa: BLE001
             # Pre-fetch failures are non-fatal in production (Q-B says
             # the provider falls through to lazy ``populate`` on cache
@@ -262,12 +327,21 @@ class PurePythonBackend:
         # ---- Step 4: construct provider --------------------------------
         # Bind a metadata-fetcher closure around T2's fetch_metadata so
         # the provider's get_dependencies (T7) receives a callable that
-        # only takes a Candidate.
+        # only takes a Candidate.  In replay mode the closure is
+        # snapshot-backed: no session, no host metadata cache, no network.
         session = self._session
         metadata_cache = self._metadata_cache
 
-        def _metadata_fetcher(candidate: Any):
-            return fetch_metadata(candidate, session, cache=metadata_cache)
+        if replay_state is not None:
+            from pipenv.resolver.snapshot import make_replay_metadata_fetcher
+
+            _metadata_fetcher = make_replay_metadata_fetcher(
+                replay_state["bundle"], replay_state["session"]
+            )
+        else:
+
+            def _metadata_fetcher(candidate: Any):
+                return fetch_metadata(candidate, session, cache=metadata_cache)
 
         provider = PurePythonProvider(
             cache=self._cache,
@@ -285,6 +359,20 @@ class PurePythonBackend:
 
         try:
             result = _drive_resolver(requirements, provider)
+        except SnapshotError as exc:
+            # Explicit, structured snapshot failure (ReplayMiss on an
+            # unrecorded fetch, SnapshotCorrupt on a digest failure) —
+            # never a silent network fallback and never a generic
+            # resolution error.
+            return ResolverResponse(
+                schema_version=SCHEMA_VERSION,
+                result=InternalError(
+                    kind="internal_error",
+                    message=str(exc),
+                    traceback=None,
+                ),
+                diagnostics=Diagnostics(),
+            )
         except ResolutionImpossible as exc:
             pip_message = self._format_resolution_impossible(exc)
             return ResolverResponse(
@@ -326,10 +414,300 @@ class PurePythonBackend:
         locked = self._translate_mapping(
             result, request_index_urls, url_to_name
         )
+
+        # ---- Step 7: snapshot finalization -----------------------------
+        if replay_state is not None:
+            return self._finish_snapshot_replay(
+                replay_state, locked
+            )
+        if recorder is not None:
+            record_response = self._finish_snapshot_record(
+                request=request,
+                mode=snapshot_mode,
+                recorder=recorder,
+                extra_reasons=record_reasons,
+                # Freeze the configured target overlay (the same value
+                # replay recomputes via ``_resolved_target_env``), not
+                # the provider's default-environment-merged dict.
+                target_env=self._resolved_target_env(),
+                locked=locked,
+            )
+            if record_response is not None:
+                return record_response
+
         return ResolverResponse(
             schema_version=SCHEMA_VERSION,
             result=ResolverSuccess(kind="success", locked=locked),
             diagnostics=Diagnostics(),
+        )
+
+    # ------------------------------------------------------------------
+    # Snapshot record/replay wiring
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _snapshot_error_response(message: str) -> ResolverResponse:
+        return ResolverResponse(
+            schema_version=SCHEMA_VERSION,
+            result=InternalError(
+                kind="internal_error",
+                message=message,
+                traceback=None,
+            ),
+            diagnostics=Diagnostics(),
+        )
+
+    def _begin_snapshot_record(
+        self, request: ResolverRequest, mode: Any
+    ) -> tuple[RecordingSession, tuple[str, ...]]:
+        """Wrap the production session/fetcher with recording transports.
+
+        The existing manifest cache and its tuning are preserved; only
+        the HTTP boundary is wrapped so every simple-page and metadata
+        exchange is captured byte-for-byte without changing behaviour.
+        """
+        from pipenv.resolver.fetcher import ParallelFetcher
+        from pipenv.resolver.pep691 import PEP691Client
+
+        source_by_url = {s.url: s.name for s in request.sources}
+        recorder = RecordingSession(
+            self._session,
+            principal_namespace=mode.principal_namespace,
+            source_by_url=source_by_url,
+        )
+        verify = bool(request.sources[0].verify_ssl) if request.sources else True
+        client = PEP691Client(recorder, verify=verify)
+        # Preserve the production fetcher's tuning rather than silently
+        # resetting the worker cap / TTL for recorded resolves.
+        max_workers = getattr(self._fetcher, "_max_workers", 16)
+        default_ttl = getattr(self._fetcher, "_default_ttl", 600)
+        self._fetcher = ParallelFetcher(
+            client,
+            self._cache,
+            max_workers=max_workers,
+            default_ttl=default_ttl,
+        )
+        self._session = recorder
+
+        # Up-front scope check: VCS / direct-file top-levels can never
+        # be represented by wheel-metadata snapshots.
+        reasons = detect_unrecordable_top_level_specs(request)
+        # Credential-bearing source URLs are stripped at every
+        # persistence boundary (freeze_request / frozen_config) and the
+        # recorder hard-fails if one reaches the request itself.
+        return recorder, reasons
+
+    def _begin_snapshot_replay(
+        self, request: ResolverRequest, mode: Any
+    ) -> dict[str, Any] | ResolverResponse:
+        """Install strictly-offline, snapshot-backed collaborators.
+
+        Runs before the normal bootstrap, so neither the host's
+        mutable manifest cache nor a network session is ever
+        constructed during replay.  All verification failures
+        (corruption, incompleteness, request mismatch) become typed
+        :class:`InternalError` responses.
+        """
+        from pipenv.resolver.manifest_cache import ParsedManifestCache
+        from pipenv.resolver.snapshot import SNAPSHOT_FORMAT_VERSION
+
+        try:
+            bundle = load_snapshot(mode.path)
+        except SnapshotCorrupt as exc:
+            return self._snapshot_error_response(str(exc))
+
+        if mode.strict:
+            try:
+                ensure_strictly_replayable(bundle)
+            except IncompleteSnapshot as exc:
+                return self._snapshot_error_response(str(exc))
+
+        if bundle.format_version != SNAPSHOT_FORMAT_VERSION:  # pragma: no cover
+            return self._snapshot_error_response(
+                f"snapshot format_version {bundle.format_version!r} is unsupported"
+            )
+
+        target_env = self._resolved_target_env()
+        try:
+            notes = check_request_compatible(
+                bundle, request, target_env, strict=mode.strict
+            )
+        except RequestMismatch as exc:
+            return self._snapshot_error_response(str(exc))
+
+        # The principal namespace is the explicit partition between
+        # authorization views; a strict replay refuses to serve a view
+        # recorded under a different principal.
+        if bundle.principal_namespace != mode.principal_namespace:
+            message = (
+                "principal_namespace mismatch: snapshot was recorded under "
+                f"{bundle.principal_namespace!r}, replay requested "
+                f"{mode.principal_namespace!r}; credential-stripped URLs must "
+                "not be merged across authorization views"
+            )
+            if mode.strict:
+                return self._snapshot_error_response(message)
+            notes = [*notes, message]
+
+        # Fresh roots inside a private temp directory: the host
+        # PIPENV_CACHE_DIR manifest/metadata caches are never read.
+        workdir = Path(tempfile.mkdtemp(prefix="pipenv-replay-"))
+        replay_cache = ParsedManifestCache(workdir / "manifests")
+        replay_metadata_cache = MetadataCache(workdir / "metadata")
+        replay_session = ReplaySession(bundle)
+        replay_fetcher = ReplayFetcher(bundle, replay_cache, replay_session)
+
+        self._session = replay_session
+        self._cache = replay_cache
+        self._fetcher = replay_fetcher
+        self._metadata_cache = replay_metadata_cache
+
+        # Algorithm differences are reported, never hidden behind a
+        # bit-identical-log guarantee.
+        notes = [*notes, *compare_algorithm_versions(bundle.algorithm)]
+        return {
+            "bundle": bundle,
+            "session": replay_session,
+            "notes": notes,
+            "mode": mode,
+        }
+
+    def _finish_snapshot_record(
+        self,
+        *,
+        request: ResolverRequest,
+        mode: Any,
+        recorder: RecordingSession,
+        extra_reasons: Sequence[str],
+        target_env: Mapping[str, Any],
+        locked: Sequence[LockedRequirement],
+    ) -> ResolverResponse | None:
+        """Build, safety-check and atomically publish the recording.
+
+        Returns an :class:`InternalError` response when publication
+        must be refused (credential leak / write failure); ``None``
+        means the recording was published and the normal success
+        response should be returned.  A failure here never leaves a
+        ``"complete"`` manifest behind — ``snapshot.json`` is the last
+        thing written.
+        """
+        import json
+        from dataclasses import asdict
+
+        from pipenv.resolver.snapshot import (
+            SNAPSHOT_FORMAT_VERSION,
+            stripped_index_url,
+        )
+
+        exchanges = enrich_manifest_identities(
+            recorder, self._cache, request.sources
+        )
+        reasons = tuple(
+            dict.fromkeys([*extra_reasons, *recorder.incomplete_reasons])
+        )
+        env_strings = {k: str(v) for k, v in sorted(target_env.items())}
+        frozen_config = {
+            "allow_prereleases": bool(request.options.pre),
+            "index_urls": [stripped_index_url(s.url) for s in request.sources],
+            "principal_namespace": mode.principal_namespace,
+            "python_marker_override": request.python_marker_override,
+        }
+        bundle = SnapshotBundle(
+            format_version=SNAPSHOT_FORMAT_VERSION,
+            principal_namespace=mode.principal_namespace,
+            created_at=utc_now_iso(),
+            complete=not reasons,
+            incomplete_reasons=reasons,
+            canonical_request=freeze_request(request, target_env),
+            target_env=env_strings,
+            frozen_config=frozen_config,
+            algorithm=algorithm_versions(),
+            exchanges=exchanges,
+            recorded_locked=tuple(lr.to_json_dict() for lr in locked),
+            bodies=recorder.bodies,
+        )
+
+        # Credential safety is verified in memory BEFORE any file is
+        # published: scan every blob plus every serialized manifest
+        # surface for the URL userinfo secrets.
+        secrets = collect_embedded_secrets([s.url for s in request.sources])
+        if secrets:
+            needles = tuple(s.encode("utf-8") for s in secrets)
+            manifest_surface = json.dumps(
+                {
+                    "canonical_request": bundle.canonical_request,
+                    "target_env": bundle.target_env,
+                    "frozen_config": bundle.frozen_config,
+                    "exchanges": [asdict(e) for e in bundle.exchanges],
+                    "recorded_locked": list(bundle.recorded_locked),
+                    "principal_namespace": bundle.principal_namespace,
+                },
+                default=str,
+                sort_keys=True,
+            ).encode("utf-8")
+            leaked = any(
+                needle in blob for blob in bundle.bodies.values() for needle in needles
+            ) or any(needle in manifest_surface for needle in needles)
+            if leaked:
+                return self._snapshot_error_response(
+                    "refusing to publish snapshot: embedded source credentials "
+                    "were detected in the recorded surface; use a "
+                    "credential-free source URL plus principal_namespace"
+                )
+
+        try:
+            write_snapshot(bundle, mode.path)
+            # Defence in depth: re-scan the published tree from disk.
+            offending = scan_tree_for_secrets(Path(mode.path), secrets)
+            if offending:  # pragma: no cover — in-memory scan precedes this
+                import shutil
+
+                shutil.rmtree(mode.path, ignore_errors=True)
+                return self._snapshot_error_response(
+                    "refusing to publish snapshot: credentials found on disk "
+                    f"in {offending!r}"
+                )
+        except SnapshotError as exc:
+            return self._snapshot_error_response(str(exc))
+        return None
+
+    def _finish_snapshot_replay(
+        self,
+        replay_state: Mapping[str, Any],
+        locked: Sequence[LockedRequirement],
+    ) -> ResolverResponse:
+        """Compare the offline replay against the recorded lock entries
+        and persist a field-level replay report.
+
+        Comparison covers version, markers, hashes and source — never
+        just the success marker.  Component-version differences and any
+        lock diff are surfaced as diagnostics warnings.
+        """
+        bundle: SnapshotBundle = replay_state["bundle"]
+        mode = replay_state["mode"]
+        notes = list(replay_state["notes"])
+
+        replay_locked = tuple(lr.to_json_dict() for lr in locked)
+        comparison = compare_lock_entries(bundle.recorded_locked, replay_locked)
+        if not comparison.equal:
+            notes.append(
+                "replay lock entries differ from the recording; see "
+                "replay-report.json for the field-level diff"
+            )
+        try:
+            write_replay_report(
+                mode.path,
+                comparison=comparison,
+                compatibility_notes=notes,
+                replay_locked=replay_locked,
+            )
+        except SnapshotError as exc:
+            return self._snapshot_error_response(str(exc))
+
+        return ResolverResponse(
+            schema_version=SCHEMA_VERSION,
+            result=ResolverSuccess(kind="success", locked=locked),
+            diagnostics=Diagnostics(warnings=tuple(notes)),
         )
 
     # ------------------------------------------------------------------
