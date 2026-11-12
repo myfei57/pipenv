@@ -1,0 +1,7 @@
+Added a local ``resolve_many`` batch API (``pipenv.resolver.resolve_many``) that
+runs a finite batch of stable-ID-bearing ``ResolverRequest`` envelopes in a
+bounded pool of fresh spawn subprocesses, with per-task marker environments,
+index credentials, working directories and deadlines, restricted JSON message
+limits, bounded redacted per-task logs, deterministic cancel/timeout/crash
+terminal states, and process-group-scoped reaping that never touches unrelated
+pip processes.

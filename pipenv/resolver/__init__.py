@@ -16,6 +16,12 @@ modules are standalone in phase 1; phases 2/3 wire them into the
 ``do_lock`` cache-prime bridge and the resolvelib-backed provider.
 """
 
+from pipenv.resolver.batch import (
+    BatchItemResult,
+    BatchResolveItem,
+    BatchResolver,
+    resolve_many,
+)
 from pipenv.resolver.candidate import Candidate, Hash
 from pipenv.resolver.fetcher import ParallelFetcher
 from pipenv.resolver.main import (
@@ -43,4 +49,9 @@ __all__ = [
     "main",
     "resolve_packages",
     "which",
+    # Bounded, subprocess-isolated batch resolver API (resolve_many).
+    "BatchItemResult",
+    "BatchResolveItem",
+    "BatchResolver",
+    "resolve_many",
 ]
